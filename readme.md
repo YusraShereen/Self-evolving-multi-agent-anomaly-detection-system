@@ -1,4 +1,4 @@
-# MCP-based Multi-Agent Anomaly Detection System
+# Self-Evolving Multi-Agent Anomaly Detection System
 
 ##  Project Structure
 
@@ -181,4 +181,5 @@ If you use this code for research, please cite:
 ## 📧 Contact
 
 For questions or issues, please open an issue on GitHub or contact yusrashereen@gmail.com.
+
 
