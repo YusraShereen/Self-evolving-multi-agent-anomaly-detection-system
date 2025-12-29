@@ -12,12 +12,7 @@ from evaluation import PerformanceEvaluator
 
 
 async def run_phase1_system(config: dict):
-    """
-    Main execution pipeline for Phase 1
-    
-    Args:
-        config: Configuration dictionary
-    """
+   
     
     print("\n" + "="*70)
     print("BRAIN MRI MULTI-AGENT SYSTEM - PHASE 1")
@@ -78,7 +73,7 @@ async def run_phase1_system(config: dict):
             )
             test_datasets[subset] = ds
         except Exception as e:
-            print(f"  {subset} not available: {e}")
+            print(f"   {subset} not available: {e}")
     
     # ========================================================================
     # 3. INITIALIZE PHASE 1 SYSTEM
@@ -118,6 +113,24 @@ async def run_phase1_system(config: dict):
     evaluator = PerformanceEvaluator(output_dir=config['output_dir'])
     all_results = {}
     retraining_required = {}
+    
+    # Check if self-evolving mode is enabled
+    self_evolving_enabled = config.get('self_evolving', {}).get('enabled', False)
+    retraining_epochs = config.get('self_evolving', {}).get('retraining_epochs', 1000)
+    evolution_history = []
+    generation = 0
+    
+    if self_evolving_enabled:
+        print("\n SELF-EVOLVING MODE ENABLED")
+        print("  System will automatically retrain on qualified test sets")
+        print(f"  Retraining epochs: {retraining_epochs}")
+        evolution_history.append({
+            'generation': generation,
+            'type': 'initial_training',
+            'train_mean': float(phase1.train_mean),
+            'train_std': float(phase1.train_std),
+            'threshold': float(phase1.train_threshold)
+        })
     
     for test_name in sorted(test_loaders.keys()):
         test_loader = test_loaders[test_name]
@@ -159,6 +172,82 @@ async def run_phase1_system(config: dict):
         print(f"  Recall:    {metrics['recall']:.4f}")
         print(f"  F1-Score:  {metrics['f1_score']:.4f}")
         print(f"  Retraining required: {retraining_required[test_name]}")
+        
+        # SELF-EVOLVING: Automatic retraining if qualified
+        if self_evolving_enabled and retraining_required[test_name]:
+            generation += 1
+            print(f"\n{'='*70}")
+            print(f" GENERATION {generation}: AUTO-RETRAINING")
+            print(f"  Trigger: {test_name} outside 3σ bounds")
+            print(f"{'='*70}")
+            
+            # Store old stats
+            old_mean = phase1.train_mean
+            old_std = phase1.train_std
+            old_threshold = phase1.train_threshold
+            
+            # Combine datasets
+            from torch.utils.data import ConcatDataset
+            combined_dataset = ConcatDataset([train_dataset, test_dataset])
+            combined_loader = DataLoader(
+                combined_dataset,
+                batch_size=config['batch_size'],
+                shuffle=True,
+                num_workers=config['num_workers'],
+                pin_memory=True
+            )
+            
+            print(f"\n Combined Training Set:")
+            print(f"  Original: {len(train_dataset)} samples")
+            print(f"  Added: {len(test_dataset)} samples")
+            print(f"  Total: {len(combined_dataset)} samples")
+            
+            # Retrain
+            print(f"\n Retraining for {retraining_epochs} epochs...")
+            await phase1.train(combined_loader, epochs=retraining_epochs)
+            
+            # Save new generation
+            gen_checkpoint = f"{config.get('checkpoint_dir', './checkpoints/phase1_final')}_gen{generation}"
+            phase1.save_models(gen_checkpoint)
+            
+            # Track evolution
+            evolution_record = {
+                'generation': generation,
+                'trigger': test_name,
+                'type': 'retraining',
+                'old_mean': float(old_mean),
+                'old_std': float(old_std),
+                'old_threshold': float(old_threshold),
+                'new_mean': float(phase1.train_mean),
+                'new_std': float(phase1.train_std),
+                'new_threshold': float(phase1.train_threshold),
+                'mean_delta': float(phase1.train_mean - old_mean),
+                'threshold_delta': float(phase1.train_threshold - old_threshold)
+            }
+            evolution_history.append(evolution_record)
+            
+            print(f"\n Evolution Statistics:")
+            print(f"  Generation: {generation}")
+            print(f"  Old threshold: {old_threshold:.6f}")
+            print(f"  New threshold: {phase1.train_threshold:.6f}")
+            print(f"  Change: {phase1.train_threshold - old_threshold:+.6f}")
+            
+            # Re-evaluate after retraining
+            print(f"\n Re-evaluating {test_name} after retraining...")
+            eval_result_after = await phase1.evaluate_temporal_subset(test_loader, test_name)
+            y_pred_after = eval_result_after['predictions']
+            metrics_after = evaluator.evaluate_predictions(
+                y_true, y_pred_after, eval_result_after['scores'], test_name
+            )
+            
+            print(f"\n Performance Improvement:")
+            print(f"  Accuracy: {metrics['accuracy']:.4f} → {metrics_after['accuracy']:.4f} "
+                  f"({metrics_after['accuracy'] - metrics['accuracy']:+.4f})")
+            print(f"  F1-Score: {metrics['f1_score']:.4f} → {metrics_after['f1_score']:.4f} "
+                  f"({metrics_after['f1_score'] - metrics['f1_score']:+.4f})")
+            
+            # Store improved results
+            all_results[f"{test_name}_after_gen{generation}"] = metrics_after
     
     # ========================================================================
     # 6. SUMMARY AND EXPORT
@@ -191,6 +280,29 @@ async def run_phase1_system(config: dict):
     stats = mcp_server.get_tool_stats()
     for tool_name, tool_stats in stats.items():
         print(f"  {tool_name}: {tool_stats['usage_count']} calls ({tool_stats['category']})")
+    
+    # Save evolution history if self-evolving
+    if self_evolving_enabled and len(evolution_history) > 1:
+        print("\n" + "="*70)
+        print("SELF-EVOLUTION SUMMARY")
+        print("="*70)
+        print(f"Total Generations: {generation}")
+        print(f"Total Retrainings: {generation}")
+        
+        print(f"\n Statistical Evolution:")
+        print(f"  Original → Current")
+        print(f"  Mean:      {evolution_history[0]['train_mean']:.6f} → {evolution_history[-1]['new_mean']:.6f}")
+        print(f"  Threshold: {evolution_history[0]['threshold']:.6f} → {evolution_history[-1]['new_threshold']:.6f}")
+        
+        # Save evolution history
+        import json
+        evolution_file = Path(config['output_dir']) / 'evolution_history.json'
+        with open(evolution_file, 'w') as f:
+            json.dump({
+                'total_generations': generation,
+                'evolution_history': evolution_history
+            }, f, indent=2)
+        print(f"\n✓ Evolution history saved: {evolution_file}")
     
     print("\n PHASE 1 COMPLETE!")
     print(f"Results saved to: {config['output_dir']}")
@@ -232,18 +344,29 @@ def main():
         type=str,
         help='Load from checkpoint instead of training'
     )
+    parser.add_argument(
+        '--enable-self-evolving',
+        action='store_true',
+        help='Enable self-evolving mode with automatic retraining'
+    )
+    parser.add_argument(
+        '--retraining-epochs',
+        type=int,
+        default=1000,
+        help='Number of epochs for retraining (default: 1000)'
+    )
     
     args = parser.parse_args()
     
     # Load configuration
     if Path(args.config).exists():
         config = load_config(args.config)
-        print(f" Loaded configuration from {args.config}")
+        print(f"✓ Loaded configuration from {args.config}")
     else:
         print(f" Configuration file not found: {args.config}")
         print("Using default configuration...")
         config = {
-            'data_root': '/path/to/data',
+            'data_root': '/root/.cache/kagglehub/datasets/yusrashereen/ad-mri-dataset/versions/3',
             'num_agents': 3,
             'epochs': 3000,
             'batch_size': 32,
@@ -262,6 +385,13 @@ def main():
         config['epochs'] = args.epochs
     if args.load_checkpoint:
         config['load_checkpoint'] = args.load_checkpoint
+    
+    # Self-evolving mode
+    if args.enable_self_evolving:
+        config['self_evolving'] = {
+            'enabled': True,
+            'retraining_epochs': args.retraining_epochs
+        }
     
     # Validate data root
     if not Path(config['data_root']).exists():
