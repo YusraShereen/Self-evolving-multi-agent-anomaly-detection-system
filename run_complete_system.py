@@ -18,15 +18,6 @@ from grpo_training import prepare_grpo_dataset, setup_grpo_training, train_grpo
 
 
 def load_qwen_model(model_name: str = "unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit"):
-    """
-    Load Qwen3-VL model with LoRA for GRPO training
-    
-    Args:
-        model_name: Model identifier
-        
-    Returns:
-        model, tokenizer: Loaded model and tokenizer
-    """
     from unsloth import FastVisionModel
     from transformers import BitsAndBytesConfig
     
@@ -66,7 +57,7 @@ def load_qwen_model(model_name: str = "unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-
         use_gradient_checkpointing="unsloth"
     )
     
-    print(f" Model loaded successfully")
+    print(f"✓ Model loaded successfully")
     return model, tokenizer
 
 
@@ -162,6 +153,22 @@ async def run_complete_system(config: dict):
     phase1_results = {}
     test_set_for_grpo = config.get('grpo_test_set', 'T1')
     
+    # Self-evolving setup
+    self_evolving_enabled = config.get('self_evolving', {}).get('enabled', False)
+    retraining_epochs = config.get('self_evolving', {}).get('retraining_epochs', 1000)
+    evolution_history = []
+    generation = 0
+    
+    if self_evolving_enabled:
+        print("\n SELF-EVOLVING MODE ENABLED")
+        print("  System will auto-retrain on qualified datasets")
+        evolution_history.append({
+            'generation': 0,
+            'type': 'initial',
+            'mean': float(phase1.train_mean),
+            'threshold': float(phase1.train_threshold)
+        })
+    
     for test_name in sorted(test_loaders.keys()):
         eval_result = await phase1.evaluate_temporal_subset(
             test_loaders[test_name], test_name
@@ -190,6 +197,37 @@ async def run_complete_system(config: dict):
         print(f"  Accuracy: {metrics['accuracy']:.4f}")
         print(f"  F1-Score: {metrics['f1_score']:.4f}")
         print(f"  Requires retraining: {eval_result['drift_detection']['requires_retraining']}")
+        
+        # SELF-EVOLVING: Auto-retrain if qualified
+        if self_evolving_enabled and eval_result['drift_detection']['requires_retraining']:
+            generation += 1
+            print(f"\n{'='*70}")
+            print(f"🔄 GENERATION {generation}: AUTO-RETRAINING")
+            print(f"  Trigger: {test_name}")
+            print(f"{'='*70}")
+            
+            # Combine datasets
+            from torch.utils.data import ConcatDataset
+            combined = ConcatDataset([train_dataset, test_datasets[test_name]])
+            combined_loader = DataLoader(
+                combined, batch_size=config['phase1']['batch_size'],
+                shuffle=True, num_workers=config['phase1']['num_workers']
+            )
+            
+            old_threshold = phase1.train_threshold
+            
+            # Retrain
+            await phase1.train(combined_loader, epochs=retraining_epochs)
+            
+            # Track
+            evolution_history.append({
+                'generation': generation,
+                'trigger': test_name,
+                'old_threshold': float(old_threshold),
+                'new_threshold': float(phase1.train_threshold)
+            })
+            
+            print(f"  Threshold: {old_threshold:.6f} → {phase1.train_threshold:.6f}")
     
     # ========================================================================
     # PHASE 2: VLM EXPLAINER WITH GRPO
@@ -318,6 +356,19 @@ async def run_complete_system(config: dict):
     for tool_name, tool_stats in stats.items():
         print(f"  {tool_name}: {tool_stats['usage_count']} calls")
     
+    # Self-evolving summary
+    if self_evolving_enabled and generation > 0:
+        print("\n SELF-EVOLUTION SUMMARY:")
+        print(f"  Total Generations: {generation}")
+        print(f"  Threshold Evolution:")
+        print(f"    Gen 0: {evolution_history[0]['threshold']:.6f}")
+        print(f"    Gen {generation}: {evolution_history[-1]['new_threshold']:.6f}")
+        
+        # Save
+        import json
+        with open(Path(config['output_dir']) / 'evolution_history.json', 'w') as f:
+            json.dump(evolution_history, f, indent=2)
+    
     print(f"\n Results saved to: {config['output_dir']}")
     print("="*70 + "\n")
     
@@ -341,18 +392,29 @@ def main():
         default='config_complete.json',
         help='Path to configuration file'
     )
+    parser.add_argument(
+        '--enable-self-evolving',
+        action='store_true',
+        help='Enable self-evolving mode (auto-retrain on drift)'
+    )
+    parser.add_argument(
+        '--retraining-epochs',
+        type=int,
+        default=1000,
+        help='Epochs for retraining (default: 1000)'
+    )
     
     args = parser.parse_args()
     
     # Load config
     if Path(args.config).exists():
         config = load_config(args.config)
-        print(f" Loaded configuration from {args.config}")
+        print(f"✓ Loaded configuration from {args.config}")
     else:
         print(f" Configuration file not found: {args.config}")
         print("Using default configuration...")
         config = {
-            'data_root': '/path/to/data',
+            'data_root': '/root/.cache/kagglehub/datasets/yusrashereen/ad-mri-dataset/versions/3',
             'output_dir': './results/complete',
             'test_subsets': ['T1', 'T2', 'T3', 'T4'],
             'grpo_test_set': 'T1',
@@ -379,6 +441,13 @@ def main():
                     'final_model_dir': './models/grpo_final'
                 }
             }
+        }
+    
+    # Override with CLI args
+    if args.enable_self_evolving:
+        config['self_evolving'] = {
+            'enabled': True,
+            'retraining_epochs': args.retraining_epochs
         }
     
     # Validate
